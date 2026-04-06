@@ -38,7 +38,11 @@ public class ImageSwipeController : MonoBehaviour
     [Header("=== Zoom Settings ===")]
     public float minZoom = 1f;
     public float maxZoom = 5f;
+    public float pinchSensitivity = 300f;
     public float zoomSpeed = 0.02f;
+    
+    // scrollSensitivity: multiplier for mouse scroll wheel in editor
+    public float scrollSensitivity = 2f;
 
     // Public so HotspotManager can stop the timer on win
     [HideInInspector] public bool gameActive = true;
@@ -152,42 +156,78 @@ public class ImageSwipeController : MonoBehaviour
     // ── Input routing ─────────────────────────────────────────────
     void HandleInput()
     {
+        HandleScrollWheel();  // editor scroll zoom — always active
+        HandleTouchInput();   // touch — active on device AND Unity Remote
 #if UNITY_EDITOR || UNITY_STANDALONE
-        HandleMouseInput();
-#else
-        HandleTouchInput();
+        HandleMouseDrag();    // mouse drag for swipe/pan in editor only
 #endif
+    }
+    
+    // ── Mouse drag (editor only) ───────────────────────────────────
+    void HandleMouseDrag()
+    {
+        if (Input.GetMouseButtonDown(0))
+        {
+            touchStartPos  = Input.mousePosition;
+            panStart       = Input.mousePosition;
+            imageStartPos  = ActiveImageRect().anchoredPosition;
+            mouseSwiping   = true;
+        }
+        else if (Input.GetMouseButton(0) && currentZoom > 1.01f)
+        {
+            Vector2 delta = (Vector2)Input.mousePosition - panStart;
+            ApplyPan(imageStartPos + delta);
+            mouseSwiping = false;
+        }
+        else if (Input.GetMouseButtonUp(0) && mouseSwiping)
+        {
+            float dx = ((Vector2)Input.mousePosition - touchStartPos).x;
+            if (currentZoom <= 1.01f) TryChangePage(dx);
+            mouseSwiping = false;
+        }
+    }
+    // ── Scroll wheel zoom (editor) ────────────────────────────────
+    void HandleScrollWheel()
+    {
+        float scroll = Input.GetAxis("Mouse ScrollWheel");
+        if (Mathf.Abs(scroll) > 0.001f)
+        {
+            ApplyZoom(currentZoom + scroll * scrollSensitivity);
+        }
     }
 
     // ── Touch ─────────────────────────────────────────────────────
     void HandleTouchInput()
     {
-        if (Input.touchCount == 2)
+        int touchCount = Input.touchCount;
+ 
+        if (touchCount == 2)
         {
+            // Two fingers — always pinch zoom, never swipe
             isPinching = true;
             isSwiping  = false;
             HandlePinchZoom();
             return;
         }
-
-        if (Input.touchCount == 1)
+ 
+        if (touchCount == 1)
         {
             Touch t = Input.GetTouch(0);
-
-            // First frame after lifting second finger — skip to avoid phantom swipe
+ 
+            // Guard: just lifted second finger, skip one frame
             if (isPinching)
             {
                 if (t.phase == TouchPhase.Ended || t.phase == TouchPhase.Canceled)
                     isPinching = false;
                 return;
             }
-
+ 
             if (currentZoom > 1.01f)
-                HandlePanAtZoom(t.phase, t.position);
+                HandlePanTouch(t);
             else
-                HandleSwipe(t.phase, t.position);
+                HandleSwipeTouch(t);
         }
-        else
+        else if (touchCount == 0)
         {
             isPinching = false;
         }
@@ -197,18 +237,26 @@ public class ImageSwipeController : MonoBehaviour
     {
         Touch t0 = Input.GetTouch(0);
         Touch t1 = Input.GetTouch(1);
-
-        float dist = Vector2.Distance(t0.position, t1.position);
-
+ 
+        float currentDist = Vector2.Distance(t0.position, t1.position);
+ 
+        // First frame of pinch — just record distance, don't zoom yet
         if (t0.phase == TouchPhase.Began || t1.phase == TouchPhase.Began)
         {
-            lastPinchDist = dist;
+            lastPinchDist = currentDist;
             return;
         }
-
-        float delta = dist - lastPinchDist;
-        lastPinchDist = dist;
-        ApplyZoom(currentZoom + delta * zoomSpeed);
+ 
+        // Delta in screen pixels between this frame and last frame
+        float deltaDist = currentDist - lastPinchDist;
+        lastPinchDist   = currentDist;
+ 
+        // Convert pixel delta to zoom amount
+        // pinchSensitivity = how many pixels of finger movement = 1.0 zoom unit
+        float zoomDelta = deltaDist / pinchSensitivity;
+        ApplyZoom(currentZoom + zoomDelta);
+ 
+        Debug.Log($"Pinch dist: {currentDist:F0}  delta: {deltaDist:F1}  zoom: {currentZoom:F2}");
     }
 
     // ── Mouse (Editor) ────────────────────────────────────────────
@@ -236,6 +284,42 @@ public class ImageSwipeController : MonoBehaviour
             float dx = ((Vector2)Input.mousePosition - touchStartPos).x;
             if (currentZoom <= 1.01f) TryChangePage(dx);
             mouseSwiping = false;
+        }
+    }
+    
+    void HandleSwipeTouch(Touch t)
+    {
+        if (t.phase == TouchPhase.Began)
+        {
+            touchStartPos = t.position;
+            isSwiping     = true;
+        }
+        else if (t.phase == TouchPhase.Moved)
+        {
+            // Cancel swipe intent if barely moved — likely a tap
+            if (Vector2.Distance(t.position, touchStartPos) < 15f)
+                isSwiping = false;
+            else
+                isSwiping = true;
+        }
+        else if (t.phase == TouchPhase.Ended && isSwiping)
+        {
+            TryChangePage(t.position.x - touchStartPos.x);
+            isSwiping = false;
+        }
+    }
+ 
+    void HandlePanTouch(Touch t)
+    {
+        if (t.phase == TouchPhase.Began)
+        {
+            panStart      = t.position;
+            imageStartPos = ActiveImageRect().anchoredPosition;
+        }
+        else if (t.phase == TouchPhase.Moved)
+        {
+            Vector2 delta = t.position - panStart;
+            ApplyPan(imageStartPos + delta);
         }
     }
 
@@ -295,13 +379,10 @@ public class ImageSwipeController : MonoBehaviour
 
     void ApplyPan(Vector2 desiredPos)
     {
-        // Clamp so user can't pan past the edges of the zoomed image
-        float maxOffsetX = panelWidth  * (currentZoom - 1f) * 0.5f;
-        float maxOffsetY = panelHeight * (currentZoom - 1f) * 0.5f;
-
-        desiredPos.x = Mathf.Clamp(desiredPos.x, -maxOffsetX, maxOffsetX);
-        desiredPos.y = Mathf.Clamp(desiredPos.y, -maxOffsetY, maxOffsetY);
-
+        float maxX = panelWidth  * (currentZoom - 1f) * 0.5f;
+        float maxY = panelHeight * (currentZoom - 1f) * 0.5f;
+        desiredPos.x = Mathf.Clamp(desiredPos.x, -maxX, maxX);
+        desiredPos.y = Mathf.Clamp(desiredPos.y, -maxY, maxY);
         ActiveImageRect().anchoredPosition = desiredPos;
     }
     
