@@ -1,20 +1,17 @@
 using UnityEngine;
 using UnityEngine.UI;
-using System.Collections;
 
-/// <summary>
-/// Handles swipe between two images, pinch-to-zoom, pan, and HUD updates.
-/// Fixes: zoom now scales the Image directly (not the panel), so hotspots
-/// stay correctly layered and visible. Images are centered properly.
-/// </summary>
 public class ImageSwipeController : MonoBehaviour
 {
+    [Header("=== Win Screen ===")]
+    public WinScreenManager winScreenManager;
+
     [Header("=== Image Panels ===")]
     public RectTransform imageContainer;
     public RectTransform imagePanel1;
     public RectTransform imagePanel2;
-    public RectTransform image1Rect;    // RectTransform on Image1 (child of ImagePanel1)
-    public RectTransform image2Rect;    // RectTransform on Image2 (child of ImagePanel2)
+    public RectTransform image1Rect;
+    public RectTransform image2Rect;
 
     [Header("=== HUD - Top Bar ===")]
     public Text scoreText;
@@ -23,66 +20,64 @@ public class ImageSwipeController : MonoBehaviour
 
     [Header("=== HUD - Bottom Bar ===")]
     public Text imageLabel;
-    [Header("=== Win Screen ===")]
-    public WinScreenManager winScreenManager;
 
     [Header("=== Game Settings ===")]
-    public int totalItems = 21;
-    public bool timerCountsDown = false;
-    public float startTime = 60f;
+    public int   totalItems      = 21;
+    public bool  timerCountsDown = true;
+    public float startTime       = 60f;
 
     [Header("=== Swipe Settings ===")]
     public float swipeThreshold = 60f;
-    public float snapSpeed = 10f;
+    public float snapSpeed      = 10f;
 
     [Header("=== Zoom Settings ===")]
-    public float minZoom = 1f;
-    public float maxZoom = 5f;
-    public float pinchSensitivity = 300f;
-    public float zoomSpeed = 0.02f;
-    
-    // scrollSensitivity: multiplier for mouse scroll wheel in editor
+    public float minZoom          = 1f;
+    public float maxZoom          = 5f;
+    public float pinchSensitivity = 200f;   // lower = faster zoom
     public float scrollSensitivity = 2f;
 
-    // Public so HotspotManager can stop the timer on win
     [HideInInspector] public bool gameActive = true;
 
     // ── Private state ─────────────────────────────────────────────
-    private int   currentPage  = 0;
-    private float score        = 0f;
-    private int   itemsFound   = 0;
-    private float elapsedTime  = 0f;
+    private int   currentPage = 0;
+    private float score       = 0f;
+    private int   itemsFound  = 0;
+    private float elapsedTime = 0f;
     private float panelWidth;
     private float panelHeight;
     private float targetX;
+    private float currentZoom    = 1f;
+    private Canvas rootCanvas;
 
     // Swipe
     private Vector2 touchStartPos;
-    private bool    isSwiping      = false;
-    private bool    mouseSwiping   = false;
+    private bool    isSwiping    = false;
+    private bool    mouseSwiping = false;
 
-    // Zoom & pan — applied to the image RectTransform directly
-    private float   currentZoom    = 1f;
-    private Vector2 imageOffset    = Vector2.zero; // pan offset on the active image
-    private bool    isPinching     = false;
-    private float   lastPinchDist  = 0f;
-    private Vector2 panStart;
-    private Vector2 imageStartPos;
+    // Pinch
+    private bool  isPinching    = false;
+    private float lastPinchDist = 0f;
+
+    // Pan
+    private Vector2 panStartCanvas;   // pan start in canvas space
+    private Vector2 imageStartPos;    // image anchoredPosition when pan started
 
     // ── Lifecycle ─────────────────────────────────────────────────
     void Start()
     {
-        // Must run after layout so rect sizes are calculated
+        // Get the root canvas so we can convert screen → canvas coords
+        rootCanvas = GetComponentInParent<Canvas>();
+        if (rootCanvas == null)
+            rootCanvas = FindObjectOfType<Canvas>();
+
         Canvas.ForceUpdateCanvases();
 
         panelWidth  = imagePanel1.rect.width;
         panelHeight = imagePanel1.rect.height;
 
-        // Force both panels to their correct positions
         imagePanel1.anchoredPosition = new Vector2(0f, 0f);
         imagePanel2.anchoredPosition = new Vector2(panelWidth, 0f);
 
-        // Start showing Image 1
         currentPage = 0;
         targetX     = 0f;
         SetContainerX(0f);
@@ -119,7 +114,7 @@ public class ImageSwipeController : MonoBehaviour
 
     string FormatTime(float s)
     {
-        int m = (int)(s / 60);
+        int m   = (int)(s / 60);
         int sec = (int)(s % 60);
         return string.Format("{0:00}:{1:00}", m, sec);
     }
@@ -135,64 +130,68 @@ public class ImageSwipeController : MonoBehaviour
     public void OnItemFound(float points = 100f)
     {
         itemsFound = Mathf.Min(itemsFound + 1, totalItems);
-        score += points;
+        score     += points;
         UpdateHUD();
     }
 
     public void ResetGame()
     {
         score = 0; itemsFound = 0; elapsedTime = 0f; gameActive = true;
+        currentPage = 0; targetX = 0f;
+        SetContainerX(0f);
+        ResetZoom();
         UpdateHUD();
     }
+
+    public int   GetScore()       { return (int)score; }
+    public float GetElapsedTime() { return elapsedTime; }
 
     // ── HUD ───────────────────────────────────────────────────────
     void UpdateHUD()
     {
         if (scoreText)      scoreText.text      = "Score: " + (int)score;
         if (itemsFoundText) itemsFoundText.text = "Found: " + itemsFound + "/" + totalItems;
-        if (imageLabel)     imageLabel.text      = currentPage == 0 ? "Original  (swipe)" : "Altered  (swipe)";
+        if (imageLabel)     imageLabel.text      = currentPage == 0
+                                                    ? "Original  (swipe)"
+                                                    : "Altered  (swipe)";
     }
 
-    // ── Input routing ─────────────────────────────────────────────
+    // ── Coordinate conversion ─────────────────────────────────────
+    // Converts a screen-space point (pixels) to canvas local space.
+    // This is the key fix — touch positions are always in screen pixels
+    // but RectTransform anchoredPosition is in canvas units.
+    // Without this conversion, zoom pivot is wrong on real devices.
+    Vector2 ScreenToCanvasPoint(Vector2 screenPoint)
+    {
+        Vector2 canvasPoint;
+        RectTransformUtility.ScreenPointToLocalPointInRectangle(
+            rootCanvas.GetComponent<RectTransform>(),
+            screenPoint,
+            rootCanvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : Camera.main,
+            out canvasPoint
+        );
+        return canvasPoint;
+    }
+
+    // ── Input ─────────────────────────────────────────────────────
     void HandleInput()
     {
-        HandleScrollWheel();  // editor scroll zoom — always active
-        HandleTouchInput();   // touch — active on device AND Unity Remote
+        HandleScrollWheel();
+        HandleTouchInput();
 #if UNITY_EDITOR || UNITY_STANDALONE
-        HandleMouseDrag();    // mouse drag for swipe/pan in editor only
+        HandleMouseDrag();
 #endif
     }
-    
-    // ── Mouse drag (editor only) ───────────────────────────────────
-    void HandleMouseDrag()
-    {
-        if (Input.GetMouseButtonDown(0))
-        {
-            touchStartPos  = Input.mousePosition;
-            panStart       = Input.mousePosition;
-            imageStartPos  = ActiveImageRect().anchoredPosition;
-            mouseSwiping   = true;
-        }
-        else if (Input.GetMouseButton(0) && currentZoom > 1.01f)
-        {
-            Vector2 delta = (Vector2)Input.mousePosition - panStart;
-            ApplyPan(imageStartPos + delta);
-            mouseSwiping = false;
-        }
-        else if (Input.GetMouseButtonUp(0) && mouseSwiping)
-        {
-            float dx = ((Vector2)Input.mousePosition - touchStartPos).x;
-            if (currentZoom <= 1.01f) TryChangePage(dx);
-            mouseSwiping = false;
-        }
-    }
-    // ── Scroll wheel zoom (editor) ────────────────────────────────
+
+    // ── Scroll wheel ──────────────────────────────────────────────
     void HandleScrollWheel()
     {
         float scroll = Input.GetAxis("Mouse ScrollWheel");
         if (Mathf.Abs(scroll) > 0.001f)
         {
-            ApplyZoom(currentZoom + scroll * scrollSensitivity);
+            // Zoom toward mouse cursor position
+            Vector2 pivot = ScreenToCanvasPoint(Input.mousePosition);
+            ApplyZoomAtPoint(currentZoom + scroll * scrollSensitivity, pivot);
         }
     }
 
@@ -200,28 +199,26 @@ public class ImageSwipeController : MonoBehaviour
     void HandleTouchInput()
     {
         int touchCount = Input.touchCount;
- 
+
         if (touchCount == 2)
         {
-            // Two fingers — always pinch zoom, never swipe
             isPinching = true;
             isSwiping  = false;
             HandlePinchZoom();
             return;
         }
- 
+
         if (touchCount == 1)
         {
             Touch t = Input.GetTouch(0);
- 
-            // Guard: just lifted second finger, skip one frame
+
             if (isPinching)
             {
                 if (t.phase == TouchPhase.Ended || t.phase == TouchPhase.Canceled)
                     isPinching = false;
                 return;
             }
- 
+
             if (currentZoom > 1.01f)
                 HandlePanTouch(t);
             else
@@ -237,45 +234,75 @@ public class ImageSwipeController : MonoBehaviour
     {
         Touch t0 = Input.GetTouch(0);
         Touch t1 = Input.GetTouch(1);
- 
+
         float currentDist = Vector2.Distance(t0.position, t1.position);
- 
-        // First frame of pinch — just record distance, don't zoom yet
+
         if (t0.phase == TouchPhase.Began || t1.phase == TouchPhase.Began)
         {
             lastPinchDist = currentDist;
             return;
         }
- 
-        // Delta in screen pixels between this frame and last frame
+
         float deltaDist = currentDist - lastPinchDist;
         lastPinchDist   = currentDist;
- 
-        // Convert pixel delta to zoom amount
-        // pinchSensitivity = how many pixels of finger movement = 1.0 zoom unit
+
         float zoomDelta = deltaDist / pinchSensitivity;
-        ApplyZoom(currentZoom + zoomDelta);
- 
-        Debug.Log($"Pinch dist: {currentDist:F0}  delta: {deltaDist:F1}  zoom: {currentZoom:F2}");
+
+        // Zoom toward the midpoint between the two fingers
+        Vector2 midpointScreen = (t0.position + t1.position) * 0.5f;
+        Vector2 midpointCanvas = ScreenToCanvasPoint(midpointScreen);
+
+        ApplyZoomAtPoint(currentZoom + zoomDelta, midpointCanvas);
     }
 
-    // ── Mouse (Editor) ────────────────────────────────────────────
-    void HandleMouseInput()
+    void HandleSwipeTouch(Touch t)
     {
-        float scroll = Input.GetAxis("Mouse ScrollWheel");
-        if (Mathf.Abs(scroll) > 0.001f)
-            ApplyZoom(currentZoom + scroll * 3f);
+        if (t.phase == TouchPhase.Began)
+        {
+            touchStartPos = t.position;
+            isSwiping     = true;
+        }
+        else if (t.phase == TouchPhase.Moved)
+        {
+            isSwiping = Vector2.Distance(t.position, touchStartPos) >= 15f;
+        }
+        else if (t.phase == TouchPhase.Ended && isSwiping)
+        {
+            TryChangePage(t.position.x - touchStartPos.x);
+            isSwiping = false;
+        }
+    }
 
+    void HandlePanTouch(Touch t)
+    {
+        if (t.phase == TouchPhase.Began)
+        {
+            // Convert touch start to canvas space immediately
+            panStartCanvas = ScreenToCanvasPoint(t.position);
+            imageStartPos  = ActiveImageRect().anchoredPosition;
+        }
+        else if (t.phase == TouchPhase.Moved)
+        {
+            Vector2 currentCanvas = ScreenToCanvasPoint(t.position);
+            Vector2 delta         = currentCanvas - panStartCanvas;
+            ApplyPan(imageStartPos + delta);
+        }
+    }
+
+    // ── Mouse drag (editor) ───────────────────────────────────────
+    void HandleMouseDrag()
+    {
         if (Input.GetMouseButtonDown(0))
         {
             touchStartPos  = Input.mousePosition;
-            panStart       = Input.mousePosition;
+            panStartCanvas = ScreenToCanvasPoint(Input.mousePosition);
             imageStartPos  = ActiveImageRect().anchoredPosition;
             mouseSwiping   = true;
         }
         else if (Input.GetMouseButton(0) && currentZoom > 1.01f)
         {
-            Vector2 delta = (Vector2)Input.mousePosition - panStart;
+            Vector2 currentCanvas = ScreenToCanvasPoint(Input.mousePosition);
+            Vector2 delta         = currentCanvas - panStartCanvas;
             ApplyPan(imageStartPos + delta);
             mouseSwiping = false;
         }
@@ -286,58 +313,8 @@ public class ImageSwipeController : MonoBehaviour
             mouseSwiping = false;
         }
     }
-    
-    void HandleSwipeTouch(Touch t)
-    {
-        if (t.phase == TouchPhase.Began)
-        {
-            touchStartPos = t.position;
-            isSwiping     = true;
-        }
-        else if (t.phase == TouchPhase.Moved)
-        {
-            // Cancel swipe intent if barely moved — likely a tap
-            if (Vector2.Distance(t.position, touchStartPos) < 15f)
-                isSwiping = false;
-            else
-                isSwiping = true;
-        }
-        else if (t.phase == TouchPhase.Ended && isSwiping)
-        {
-            TryChangePage(t.position.x - touchStartPos.x);
-            isSwiping = false;
-        }
-    }
- 
-    void HandlePanTouch(Touch t)
-    {
-        if (t.phase == TouchPhase.Began)
-        {
-            panStart      = t.position;
-            imageStartPos = ActiveImageRect().anchoredPosition;
-        }
-        else if (t.phase == TouchPhase.Moved)
-        {
-            Vector2 delta = t.position - panStart;
-            ApplyPan(imageStartPos + delta);
-        }
-    }
 
-    // ── Swipe ─────────────────────────────────────────────────────
-    void HandleSwipe(TouchPhase phase, Vector2 pos)
-    {
-        if (phase == TouchPhase.Began)
-        {
-            touchStartPos = pos;
-            isSwiping     = true;
-        }
-        else if (phase == TouchPhase.Ended && isSwiping)
-        {
-            TryChangePage(pos.x - touchStartPos.x);
-            isSwiping = false;
-        }
-    }
-
+    // ── Page swiping ──────────────────────────────────────────────
     void TryChangePage(float dx)
     {
         if (dx < -swipeThreshold && currentPage == 0)
@@ -362,21 +339,55 @@ public class ImageSwipeController : MonoBehaviour
         imageContainer.anchoredPosition = pos;
     }
 
-    // ── Pan while zoomed ──────────────────────────────────────────
-    void HandlePanAtZoom(TouchPhase phase, Vector2 pos)
+    // ── Zoom toward a canvas-space point ──────────────────────────
+    // Instead of scaling from the center, we shift the image so the
+    // point under the fingers stays fixed as the image grows.
+    void ApplyZoomAtPoint(float newZoom, Vector2 canvasPivot)
     {
-        if (phase == TouchPhase.Began)
+        float clampedZoom = Mathf.Clamp(newZoom, minZoom, maxZoom);
+        if (clampedZoom <= minZoom + 0.01f)
         {
-            panStart      = pos;
-            imageStartPos = ActiveImageRect().anchoredPosition;
+            ResetZoom();
+            return;
         }
-        else if (phase == TouchPhase.Moved)
-        {
-            Vector2 delta = pos - panStart;
-            ApplyPan(imageStartPos + delta);
-        }
+
+        RectTransform img  = ActiveImageRect();
+        float         oldZoom  = currentZoom;
+        Vector2       oldPos   = img.anchoredPosition;
+
+        // How much the image will grow
+        float zoomRatio = clampedZoom / oldZoom;
+
+        // Shift the image so the pivot point stays under the fingers
+        // Formula: newPos = pivot + (oldPos - pivot) * zoomRatio
+        Vector2 newPos = canvasPivot + (oldPos - canvasPivot) * zoomRatio;
+
+        currentZoom        = clampedZoom;
+        img.localScale     = Vector3.one * currentZoom;
+
+        // Clamp pan so we can't go outside image bounds
+        float maxX = panelWidth  * (currentZoom - 1f) * 0.5f;
+        float maxY = panelHeight * (currentZoom - 1f) * 0.5f;
+        newPos.x   = Mathf.Clamp(newPos.x, -maxX, maxX);
+        newPos.y   = Mathf.Clamp(newPos.y, -maxY, maxY);
+
+        img.anchoredPosition = newPos;
     }
 
+    // ── Zoom (simple, no pivot) ───────────────────────────────────
+    void ApplyZoom(float newZoom)
+    {
+        ApplyZoomAtPoint(newZoom, Vector2.zero);
+    }
+
+    void ResetZoom()
+    {
+        currentZoom = 1f;
+        if (image1Rect) { image1Rect.localScale = Vector3.one; image1Rect.anchoredPosition = Vector2.zero; }
+        if (image2Rect) { image2Rect.localScale = Vector3.one; image2Rect.anchoredPosition = Vector2.zero; }
+    }
+
+    // ── Pan ───────────────────────────────────────────────────────
     void ApplyPan(Vector2 desiredPos)
     {
         float maxX = panelWidth  * (currentZoom - 1f) * 0.5f;
@@ -384,38 +395,6 @@ public class ImageSwipeController : MonoBehaviour
         desiredPos.x = Mathf.Clamp(desiredPos.x, -maxX, maxX);
         desiredPos.y = Mathf.Clamp(desiredPos.y, -maxY, maxY);
         ActiveImageRect().anchoredPosition = desiredPos;
-    }
-    
-    // Getters for WinScreenManager
-    public int   GetScore()       { return (int)score; }
-    public float GetElapsedTime() { return elapsedTime; }
-
-    // ── Zoom ──────────────────────────────────────────────────────
-    // Zoom scales the Image RectTransform directly — NOT the panel.
-    // This keeps hotspots (siblings of the image, children of the panel)
-    // in their correct screen positions so they stay tappable and visible.
-    void ApplyZoom(float newZoom)
-    {
-        currentZoom = Mathf.Clamp(newZoom, minZoom, maxZoom);
-        ActiveImageRect().localScale = Vector3.one * currentZoom;
-
-        if (currentZoom <= minZoom + 0.01f)
-            ResetZoom();
-    }
-
-    void ResetZoom()
-    {
-        currentZoom = 1f;
-        if (image1Rect)
-        {
-            image1Rect.localScale        = Vector3.one;
-            image1Rect.anchoredPosition  = Vector2.zero;
-        }
-        if (image2Rect)
-        {
-            image2Rect.localScale        = Vector3.one;
-            image2Rect.anchoredPosition  = Vector2.zero;
-        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────
